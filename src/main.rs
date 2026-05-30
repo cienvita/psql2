@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::{Context, Editor};
@@ -8,6 +10,16 @@ const KEYWORDS: &[&str] = &[
     "select", "from", "where", "insert", "update", "delete", "create", "table", "\\q", "\\h",
     "\\d", "\\l",
 ];
+
+/// Path to the history file: `.psql2_history` in the user's home directory,
+/// falling back to the current directory if home can't be determined.
+fn history_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    home.join(".psql2_history")
+}
 
 #[derive(Helper, Highlighter, Hinter, Validator)]
 struct ReplHelper;
@@ -44,6 +56,17 @@ fn main() -> rustyline::Result<()> {
     let mut rl: Editor<ReplHelper, _> = Editor::new()?;
     rl.set_helper(Some(ReplHelper));
 
+    let history = history_path();
+    // Missing file on first run is expected; surface anything else.
+    if let Err(err) = rl.load_history(&history) {
+        if !matches!(&err, ReadlineError::Io(e) if e.kind() == std::io::ErrorKind::NotFound) {
+            eprintln!(
+                "warning: could not load history from {}: {err}",
+                history.display()
+            );
+        }
+    }
+
     println!("psql2. Type \\q to quit, Tab to complete.");
 
     loop {
@@ -66,6 +89,13 @@ fn main() -> rustyline::Result<()> {
                 break;
             }
         }
+    }
+
+    if let Err(err) = rl.save_history(&history) {
+        eprintln!(
+            "warning: could not save history to {}: {err}",
+            history.display()
+        );
     }
 
     Ok(())
