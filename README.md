@@ -18,6 +18,26 @@ With no connection string it starts offline (completion and history only).
 Type a few letters and press Tab to complete. `\q` or Ctrl-D exits,
 Ctrl-C clears the current line.
 
+## Non-interactive use
+
+For scripts and tools, run a single command and exit:
+
+    psql2 -c "select id, email from users" "host=localhost dbname=db"
+    psql2 -c "select id, email from users" --json    # uses DATABASE_URL
+
+With `--json`, row data is written to stdout as a JSON array of objects;
+diagnostics and errors go to stderr, and the exit code is non-zero on a
+database error.
+
+Schema discovery (always JSON on stdout):
+
+    psql2 --schema                 # list tables with column counts
+    psql2 --schema users orders    # columns, types, primary key, foreign keys
+
+When using `--schema` with table names, supply the connection via
+`DATABASE_URL` (a positional connection string would be consumed as a table
+name). Foreign-key output assumes single-column keys.
+
 Connections are made without TLS for now, so servers that require SSL are
 not yet supported.
 

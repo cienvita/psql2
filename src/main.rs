@@ -1,17 +1,41 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
+use clap::Parser;
 use postgres::{Client, NoTls, SimpleQueryMessage};
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::{Context, Editor};
 use rustyline_derive::{Helper, Highlighter, Hinter, Validator};
+use serde_json::{json, Value};
 
 /// Stub vocabulary used for tab completion. Real commands come later.
 const KEYWORDS: &[&str] = &[
     "select", "from", "where", "insert", "update", "delete", "create", "table", "\\q", "\\h",
     "\\d", "\\l",
 ];
+
+#[derive(Parser)]
+#[command(version, about = "A psql client with tab completion")]
+struct Cli {
+    /// libpq connection string or URL. Falls back to DATABASE_URL.
+    connection: Option<String>,
+
+    /// Run a single SQL command and exit instead of starting the REPL.
+    #[arg(short = 'c', long = "command", value_name = "SQL")]
+    command: Option<String>,
+
+    /// Describe schema and exit: with no names, list tables; with table
+    /// names, show their columns, primary key, and foreign keys (JSON).
+    #[arg(long, num_args = 0.., value_name = "TABLE")]
+    schema: Option<Vec<String>>,
+
+    /// Emit JSON instead of an aligned table (implied by --schema).
+    #[arg(long)]
+    json: bool,
+}
 
 /// Path to the history file: `.psql2_history` in the user's home directory,
 /// falling back to the current directory if home can't be determined.
@@ -99,65 +123,76 @@ fn load_tables(client: &mut Client) -> Vec<String> {
     }
 }
 
-/// Connect using the first CLI argument or `DATABASE_URL` as a libpq
-/// connection string. Returns `None` when no connection info is supplied, so
-/// the REPL still runs offline. Exits the process if a string was given but
-/// the connection failed.
-fn connect() -> Option<Client> {
-    let conn = std::env::args()
-        .nth(1)
-        .or_else(|| std::env::var("DATABASE_URL").ok());
-
-    let Some(conn) = conn else {
-        println!("not connected. Pass a connection string as an argument or set DATABASE_URL.");
-        return None;
-    };
-
-    match Client::connect(&conn, NoTls) {
-        Ok(client) => {
-            println!("connected.");
-            Some(client)
-        }
-        Err(err) => {
-            eprintln!("connection failed: {err}");
-            std::process::exit(1);
-        }
+/// Print a database error and its source chain to stderr. The useful detail
+/// (e.g. "relation does not exist") lives in the source, not the top Display.
+fn print_db_error(err: &postgres::Error) {
+    eprint!("error: {err}");
+    let mut source = err.source();
+    while let Some(cause) = source {
+        eprint!(": {cause}");
+        source = cause.source();
     }
+    eprintln!();
 }
 
-/// Run one SQL string (possibly several statements) and print each result.
-/// `simple_query` returns every value as text, which is what a generic client
-/// needs since result types are not known ahead of time.
-fn run_sql(client: &mut Client, sql: &str) {
+/// Run one SQL string and print results to stdout. With `json`, emit a JSON
+/// array of row objects (data only on stdout); otherwise an aligned table.
+/// Returns `Err` on a database error so callers can set the exit code.
+fn run_command(client: &mut Client, sql: &str, json: bool) -> Result<(), ()> {
     let messages = match client.simple_query(sql) {
         Ok(messages) => messages,
         Err(err) => {
-            // The useful detail (e.g. "relation does not exist") lives in the
-            // error's source chain, not its top-level Display.
-            eprint!("error: {err}");
-            let mut source = err.source();
-            while let Some(cause) = source {
-                eprint!(": {cause}");
-                source = cause.source();
-            }
-            eprintln!();
-            return;
+            print_db_error(&err);
+            return Err(());
         }
     };
 
+    if json {
+        let mut headers: Vec<String> = Vec::new();
+        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        let mut affected = 0u64;
+        for msg in &messages {
+            match msg {
+                SimpleQueryMessage::Row(row) => {
+                    if headers.is_empty() {
+                        headers = row.columns().iter().map(|c| c.name().to_string()).collect();
+                    }
+                    rows.push(
+                        (0..row.columns().len())
+                            .map(|i| row.get(i).map(str::to_string))
+                            .collect(),
+                    );
+                }
+                SimpleQueryMessage::CommandComplete(n) => affected = *n,
+                _ => {}
+            }
+        }
+        println!("{}", rows_to_json(&headers, &rows));
+        if headers.is_empty() {
+            eprintln!("rows affected: {affected}");
+        }
+    } else {
+        print_results(&messages);
+    }
+    Ok(())
+}
+
+/// Print result messages as aligned tables and `OK (n)` lines on stdout.
+fn print_results(messages: &[SimpleQueryMessage]) {
     let mut headers: Vec<String> = Vec::new();
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
 
-    for msg in &messages {
+    for msg in messages {
         match msg {
             SimpleQueryMessage::Row(row) => {
                 if headers.is_empty() {
                     headers = row.columns().iter().map(|c| c.name().to_string()).collect();
                 }
-                let cells = (0..row.columns().len())
-                    .map(|i| row.get(i).map(str::to_string))
-                    .collect();
-                rows.push(cells);
+                rows.push(
+                    (0..row.columns().len())
+                        .map(|i| row.get(i).map(str::to_string))
+                        .collect(),
+                );
             }
             SimpleQueryMessage::CommandComplete(affected) => {
                 if headers.is_empty() {
@@ -177,6 +212,29 @@ fn run_sql(client: &mut Client, sql: &str) {
     if !headers.is_empty() {
         println!("{}", format_table(&headers, &rows));
     }
+}
+
+/// Convert rows to a JSON array of objects keyed by column name. A NULL cell
+/// (`None`) becomes JSON null. Kept free of database types so it is testable.
+fn rows_to_json(headers: &[String], rows: &[Vec<Option<String>>]) -> Value {
+    let objects: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let obj: serde_json::Map<String, Value> = headers
+                .iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    let v = row
+                        .get(i)
+                        .and_then(|c| c.clone())
+                        .map_or(Value::Null, Value::String);
+                    (h.clone(), v)
+                })
+                .collect();
+            Value::Object(obj)
+        })
+        .collect();
+    Value::Array(objects)
 }
 
 /// Render rows as an aligned text table, psql-style. A NULL cell (`None`) is
@@ -221,8 +279,199 @@ fn format_table(headers: &[String], rows: &[Vec<Option<String>>]) -> String {
     out
 }
 
-fn main() -> rustyline::Result<()> {
-    let mut client = connect();
+/// Schema discovery. With no table names, list user tables and their column
+/// counts. With names, describe each table's columns, primary key, and foreign
+/// keys. Always emits JSON to stdout.
+fn run_schema(client: &mut Client, tables: &[String]) -> Result<(), ()> {
+    let value = if tables.is_empty() {
+        schema_list(client)
+    } else {
+        schema_detail(client, tables)
+    };
+    match value {
+        Ok(value) => {
+            println!("{value}");
+            Ok(())
+        }
+        Err(err) => {
+            print_db_error(&err);
+            Err(())
+        }
+    }
+}
+
+fn schema_list(client: &mut Client) -> Result<Value, postgres::Error> {
+    let rows = client.query(
+        "SELECT t.table_schema, t.table_name, count(c.column_name)::int \
+         FROM information_schema.tables t \
+         LEFT JOIN information_schema.columns c \
+           ON c.table_schema = t.table_schema AND c.table_name = t.table_name \
+         WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema') \
+           AND t.table_type = 'BASE TABLE' \
+         GROUP BY t.table_schema, t.table_name \
+         ORDER BY t.table_schema, t.table_name",
+        &[],
+    )?;
+    let tables: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "schema": r.get::<_, String>(0),
+                "table": r.get::<_, String>(1),
+                "columns": r.get::<_, i32>(2),
+            })
+        })
+        .collect();
+    Ok(Value::Array(tables))
+}
+
+fn schema_detail(client: &mut Client, tables: &[String]) -> Result<Value, postgres::Error> {
+    let names = tables.to_vec();
+
+    let col_rows = client.query(
+        "SELECT table_schema, table_name, column_name, data_type, is_nullable \
+         FROM information_schema.columns \
+         WHERE table_name::text = ANY($1) \
+           AND table_schema NOT IN ('pg_catalog', 'information_schema') \
+         ORDER BY table_schema, table_name, ordinal_position",
+        &[&names],
+    )?;
+    let pk_rows = client.query(
+        "SELECT tc.table_schema, tc.table_name, kcu.column_name \
+         FROM information_schema.table_constraints tc \
+         JOIN information_schema.key_column_usage kcu \
+           ON kcu.constraint_name = tc.constraint_name \
+           AND kcu.table_schema = tc.table_schema \
+         WHERE tc.constraint_type = 'PRIMARY KEY' \
+           AND tc.table_name::text = ANY($1) \
+         ORDER BY kcu.ordinal_position",
+        &[&names],
+    )?;
+    let fk_rows = client.query(
+        "SELECT tc.table_schema, tc.table_name, kcu.column_name, \
+                ccu.table_schema, ccu.table_name, ccu.column_name \
+         FROM information_schema.table_constraints tc \
+         JOIN information_schema.key_column_usage kcu \
+           ON kcu.constraint_name = tc.constraint_name \
+           AND kcu.table_schema = tc.table_schema \
+         JOIN information_schema.constraint_column_usage ccu \
+           ON ccu.constraint_name = tc.constraint_name \
+           AND ccu.table_schema = tc.table_schema \
+         WHERE tc.constraint_type = 'FOREIGN KEY' \
+           AND tc.table_name::text = ANY($1)",
+        &[&names],
+    )?;
+
+    type Key = (String, String);
+    let key = |r: &postgres::Row| -> Key { (r.get(0), r.get(1)) };
+
+    let mut order: Vec<Key> = Vec::new();
+    let mut columns: BTreeMap<Key, Vec<Value>> = BTreeMap::new();
+    for r in &col_rows {
+        let k = key(r);
+        if !columns.contains_key(&k) {
+            order.push(k.clone());
+        }
+        columns.entry(k).or_default().push(json!({
+            "name": r.get::<_, String>(2),
+            "type": r.get::<_, String>(3),
+            "nullable": r.get::<_, String>(4) == "YES",
+        }));
+    }
+
+    let mut primary: BTreeMap<Key, Vec<String>> = BTreeMap::new();
+    for r in &pk_rows {
+        primary.entry(key(r)).or_default().push(r.get(2));
+    }
+
+    let mut foreign: BTreeMap<Key, Vec<Value>> = BTreeMap::new();
+    for r in &fk_rows {
+        foreign.entry(key(r)).or_default().push(json!({
+            "column": r.get::<_, String>(2),
+            "references": {
+                "schema": r.get::<_, String>(3),
+                "table": r.get::<_, String>(4),
+                "column": r.get::<_, String>(5),
+            },
+        }));
+    }
+
+    let described: Vec<Value> = order
+        .iter()
+        .map(|k| {
+            json!({
+                "schema": k.0,
+                "table": k.1,
+                "columns": columns.get(k).cloned().unwrap_or_default(),
+                "primary_key": primary.get(k).cloned().unwrap_or_default(),
+                "foreign_keys": foreign.get(k).cloned().unwrap_or_default(),
+            })
+        })
+        .collect();
+    Ok(Value::Array(described))
+}
+
+/// Resolve the connection string from the CLI argument or DATABASE_URL.
+fn resolve_connection(cli: &Cli) -> Option<String> {
+    cli.connection
+        .clone()
+        .or_else(|| std::env::var("DATABASE_URL").ok())
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    // Non-interactive modes require a connection and emit only data to stdout.
+    if cli.schema.is_some() || cli.command.is_some() {
+        let Some(conn) = resolve_connection(&cli) else {
+            eprintln!("error: a connection is required (argument or DATABASE_URL)");
+            return ExitCode::FAILURE;
+        };
+        let mut client = match Client::connect(&conn, NoTls) {
+            Ok(client) => client,
+            Err(err) => {
+                eprintln!("connection failed: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let result = match &cli.schema {
+            Some(tables) => run_schema(&mut client, tables),
+            None => run_command(&mut client, cli.command.as_deref().unwrap(), cli.json),
+        };
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(()) => ExitCode::FAILURE,
+        };
+    }
+
+    match repl(resolve_connection(&cli)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Interactive REPL: connect if possible, then read-eval-print until `\q`.
+fn repl(conn: Option<String>) -> rustyline::Result<()> {
+    let mut client = match conn {
+        Some(conn) => match Client::connect(&conn, NoTls) {
+            Ok(client) => {
+                println!("connected.");
+                Some(client)
+            }
+            Err(err) => {
+                eprintln!("connection failed: {err}");
+                return Ok(());
+            }
+        },
+        None => {
+            println!("not connected. Pass a connection string or set DATABASE_URL.");
+            None
+        }
+    };
+
     let tables = client.as_mut().map(load_tables).unwrap_or_default();
     if !tables.is_empty() {
         println!("{} table(s) available for completion.", tables.len());
@@ -256,7 +505,9 @@ fn main() -> rustyline::Result<()> {
                     break;
                 }
                 match client.as_mut() {
-                    Some(c) => run_sql(c, trimmed),
+                    Some(c) => {
+                        let _ = run_command(c, trimmed, false);
+                    }
                     None => println!("not connected: {trimmed}"),
                 }
             }
@@ -281,7 +532,8 @@ fn main() -> rustyline::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{expects_table, format_table};
+    use super::{expects_table, format_table, rows_to_json};
+    use serde_json::json;
 
     fn s(v: &str) -> Option<String> {
         Some(v.to_string())
@@ -342,5 +594,23 @@ mod tests {
         let headers = vec!["a".to_string()];
         let rows = vec![vec![None]];
         assert!(format_table(&headers, &rows).contains("   \n"));
+    }
+
+    #[test]
+    fn json_rows_are_objects_with_null_for_missing() {
+        let headers = vec!["id".to_string(), "name".to_string()];
+        let rows = vec![vec![s("1"), s("alice")], vec![s("2"), None]];
+        let expected = json!([
+            {"id": "1", "name": "alice"},
+            {"id": "2", "name": null},
+        ]);
+        assert_eq!(rows_to_json(&headers, &rows), expected);
+    }
+
+    #[test]
+    fn json_empty_result_is_empty_array() {
+        let headers: Vec<String> = vec![];
+        let rows: Vec<Vec<Option<String>>> = vec![];
+        assert_eq!(rows_to_json(&headers, &rows), json!([]));
     }
 }
