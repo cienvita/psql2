@@ -7,6 +7,20 @@ against a stub keyword list, command history persisted to
 `~/.psql2_history`, and `\q` to quit. It can connect to PostgreSQL and run
 queries, printing results as an aligned table.
 
+## Install
+
+Not on crates.io. Install the binary from this repo (needs a Rust toolchain):
+
+    cargo install --git https://github.com/cienvita/psql2
+
+Pin to a tag, branch, or commit:
+
+    cargo install --git https://github.com/cienvita/psql2 --tag v0.1.0
+    cargo install --git https://github.com/cienvita/psql2 --branch main
+    cargo install --git https://github.com/cienvita/psql2 --rev <sha>
+
+This builds and places `psql2` in `~/.cargo/bin`.
+
 ## Usage
 
 Pass a libpq connection string as the first argument, or set `DATABASE_URL`:
