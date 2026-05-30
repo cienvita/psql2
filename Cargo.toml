@@ -2,6 +2,11 @@
 name = "psql2"
 version = "0.1.0"
 edition = "2021"
+description = "An attempt at a psql client with tab completion and a friendlier cross-platform terminal UX."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cienvita/psql2"
+readme = "README.md"
+publish = false
 
 [dependencies]
 rustyline = "14"
