@@ -23,8 +23,21 @@ fn history_path() -> PathBuf {
     home.join(".psql2_history")
 }
 
+/// True when the text immediately before the word under the cursor expects a
+/// table name, i.e. the last token is a clause keyword that introduces one.
+fn expects_table(prefix: &str) -> bool {
+    let last = prefix.split_whitespace().next_back();
+    matches!(
+        last.map(str::to_ascii_lowercase).as_deref(),
+        Some("from" | "join" | "into" | "update")
+    )
+}
+
 #[derive(Helper, Highlighter, Hinter, Validator)]
-struct ReplHelper;
+struct ReplHelper {
+    /// Table names loaded from the connected database, for completion.
+    tables: Vec<String>,
+}
 
 impl Completer for ReplHelper {
     type Candidate = Pair;
@@ -41,16 +54,48 @@ impl Completer for ReplHelper {
             .map_or(0, |i| i + 1);
         let word = &line[start..pos];
 
-        let matches = KEYWORDS
-            .iter()
-            .filter(|kw| kw.starts_with(word))
-            .map(|kw| Pair {
-                display: kw.to_string(),
-                replacement: kw.to_string(),
-            })
-            .collect();
+        let to_pair = |s: &str| Pair {
+            display: s.to_string(),
+            replacement: s.to_string(),
+        };
+
+        // After FROM (and similar), complete table names; otherwise keywords.
+        let matches: Vec<Pair> = if expects_table(&line[..start]) {
+            self.tables
+                .iter()
+                .filter(|t| t.starts_with(word))
+                .map(|t| to_pair(t))
+                .collect()
+        } else {
+            KEYWORDS
+                .iter()
+                .filter(|kw| kw.starts_with(word))
+                .map(|kw| to_pair(kw))
+                .collect()
+        };
 
         Ok((start, matches))
+    }
+}
+
+/// Load user table names from the catalog for completion. System schemas are
+/// excluded. Returns empty on error so the REPL keeps working.
+fn load_tables(client: &mut Client) -> Vec<String> {
+    let sql = "SELECT table_name FROM information_schema.tables \
+               WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+               ORDER BY table_name";
+    match client.simple_query(sql) {
+        Ok(messages) => messages
+            .iter()
+            .filter_map(|m| match m {
+                SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+                _ => None,
+            })
+            .collect(),
+        Err(err) => {
+            eprintln!("warning: could not load schema for completion: {err}");
+            Vec::new()
+        }
     }
 }
 
@@ -178,9 +223,13 @@ fn format_table(headers: &[String], rows: &[Vec<Option<String>>]) -> String {
 
 fn main() -> rustyline::Result<()> {
     let mut client = connect();
+    let tables = client.as_mut().map(load_tables).unwrap_or_default();
+    if !tables.is_empty() {
+        println!("{} table(s) available for completion.", tables.len());
+    }
 
     let mut rl: Editor<ReplHelper, _> = Editor::new()?;
-    rl.set_helper(Some(ReplHelper));
+    rl.set_helper(Some(ReplHelper { tables }));
 
     let history = history_path();
     // Missing file on first run is expected; surface anything else.
@@ -232,10 +281,30 @@ fn main() -> rustyline::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::format_table;
+    use super::{expects_table, format_table};
 
     fn s(v: &str) -> Option<String> {
         Some(v.to_string())
+    }
+
+    #[test]
+    fn expects_table_after_table_keywords() {
+        assert!(expects_table("select * from "));
+        assert!(expects_table("select * from users join "));
+        assert!(expects_table("update "));
+        assert!(expects_table("insert into "));
+    }
+
+    #[test]
+    fn expects_table_is_case_insensitive() {
+        assert!(expects_table("SELECT * FROM "));
+    }
+
+    #[test]
+    fn no_table_completion_elsewhere() {
+        assert!(!expects_table("select "));
+        assert!(!expects_table("select * from users where "));
+        assert!(!expects_table(""));
     }
 
     #[test]
