@@ -2,16 +2,24 @@
 
 An attempt to make a psql client with tab completions.
 
-Early work in progress. Right now it is a REPL shell: a `#` prompt with
-tab completion against a stub keyword list, command history persisted to
-`~/.psql2_history`, and `\q` to quit. There is no database connection yet.
+Early work in progress. A REPL shell: a `#` prompt with tab completion
+against a stub keyword list, command history persisted to
+`~/.psql2_history`, and `\q` to quit. It can connect to PostgreSQL and run
+queries, printing results as an aligned table.
 
 ## Usage
 
-    cargo run
+Pass a libpq connection string as the first argument, or set `DATABASE_URL`:
 
+    cargo run -- "host=localhost user=postgres dbname=postgres"
+    DATABASE_URL="postgres://user:pw@localhost/db" cargo run
+
+With no connection string it starts offline (completion and history only).
 Type a few letters and press Tab to complete. `\q` or Ctrl-D exits,
 Ctrl-C clears the current line.
+
+Connections are made without TLS for now, so servers that require SSL are
+not yet supported.
 
 ## License
 

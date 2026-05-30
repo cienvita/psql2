@@ -9,5 +9,6 @@ readme = "README.md"
 publish = false
 
 [dependencies]
+postgres = "0.19"
 rustyline = "14"
 rustyline-derive = "0.10"
