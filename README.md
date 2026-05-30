@@ -29,6 +29,15 @@ With `--json`, row data is written to stdout as a JSON array of objects;
 diagnostics and errors go to stderr, and the exit code is non-zero on a
 database error.
 
+Add `--columns` to get each result column's name and Postgres type:
+
+    psql2 -c "select count(*) as n from orders" --columns
+
+This changes the output to a `{"columns": [...], "rows": [...]}` object.
+Types are resolved for any query, including computed columns and aggregates.
+Nullability is not included: Postgres does not report it for arbitrary
+result columns (use `--schema` for per-table nullability).
+
 Schema discovery (always JSON on stdout):
 
     psql2 --schema                 # list tables with column counts

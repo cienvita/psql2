@@ -35,6 +35,11 @@ struct Cli {
     /// Emit JSON instead of an aligned table (implied by --schema).
     #[arg(long)]
     json: bool,
+
+    /// With -c, emit a JSON {columns, rows} object where each result column
+    /// carries its name and Postgres type. Implies JSON output.
+    #[arg(long)]
+    columns: bool,
 }
 
 /// Path to the history file: `.psql2_history` in the user's home directory,
@@ -135,10 +140,15 @@ fn print_db_error(err: &postgres::Error) {
     eprintln!();
 }
 
-/// Run one SQL string and print results to stdout. With `json`, emit a JSON
-/// array of row objects (data only on stdout); otherwise an aligned table.
-/// Returns `Err` on a database error so callers can set the exit code.
-fn run_command(client: &mut Client, sql: &str, json: bool) -> Result<(), ()> {
+/// Run one SQL string and print results to stdout. With `columns`, emit a JSON
+/// `{columns, rows}` object including each result column's name and type. With
+/// `json`, emit a JSON array of row objects. Otherwise an aligned table. Data
+/// only on stdout; returns `Err` on a database error so callers set the exit code.
+fn run_command(client: &mut Client, sql: &str, json: bool, columns: bool) -> Result<(), ()> {
+    if columns {
+        return run_command_with_columns(client, sql);
+    }
+
     let messages = match client.simple_query(sql) {
         Ok(messages) => messages,
         Err(err) => {
@@ -175,6 +185,68 @@ fn run_command(client: &mut Client, sql: &str, json: bool) -> Result<(), ()> {
         print_results(&messages);
     }
     Ok(())
+}
+
+/// Run a query and emit a JSON `{columns, rows}` object. Column types come
+/// from preparing the statement (which resolves result types for any query);
+/// values come from executing it. Nullability is not included because Postgres
+/// does not report it for arbitrary result columns (use --schema per table).
+fn run_command_with_columns(client: &mut Client, sql: &str) -> Result<(), ()> {
+    let statement = match client.prepare(sql) {
+        Ok(statement) => statement,
+        Err(err) => {
+            print_db_error(&err);
+            return Err(());
+        }
+    };
+    let column_types: Vec<(String, String)> = statement
+        .columns()
+        .iter()
+        .map(|c| (c.name().to_string(), c.type_().name().to_string()))
+        .collect();
+    let headers: Vec<String> = column_types.iter().map(|(name, _)| name.clone()).collect();
+
+    let messages = match client.simple_query(sql) {
+        Ok(messages) => messages,
+        Err(err) => {
+            print_db_error(&err);
+            return Err(());
+        }
+    };
+    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    let mut affected = 0u64;
+    for msg in &messages {
+        match msg {
+            SimpleQueryMessage::Row(row) => {
+                rows.push(
+                    (0..row.columns().len())
+                        .map(|i| row.get(i).map(str::to_string))
+                        .collect(),
+                );
+            }
+            SimpleQueryMessage::CommandComplete(n) => affected = *n,
+            _ => {}
+        }
+    }
+
+    let output = json!({
+        "columns": columns_block(&column_types),
+        "rows": rows_to_json(&headers, &rows),
+    });
+    println!("{output}");
+    if column_types.is_empty() {
+        eprintln!("rows affected: {affected}");
+    }
+    Ok(())
+}
+
+/// Build the `columns` JSON array from (name, type) pairs.
+fn columns_block(columns: &[(String, String)]) -> Value {
+    let entries: Vec<Value> = columns
+        .iter()
+        .map(|(name, ty)| json!({"name": name, "type": ty}))
+        .collect();
+    Value::Array(entries)
 }
 
 /// Print result messages as aligned tables and `OK (n)` lines on stdout.
@@ -436,7 +508,12 @@ fn main() -> ExitCode {
         };
         let result = match &cli.schema {
             Some(tables) => run_schema(&mut client, tables),
-            None => run_command(&mut client, cli.command.as_deref().unwrap(), cli.json),
+            None => run_command(
+                &mut client,
+                cli.command.as_deref().unwrap(),
+                cli.json,
+                cli.columns,
+            ),
         };
         return match result {
             Ok(()) => ExitCode::SUCCESS,
@@ -506,7 +583,7 @@ fn repl(conn: Option<String>) -> rustyline::Result<()> {
                 }
                 match client.as_mut() {
                     Some(c) => {
-                        let _ = run_command(c, trimmed, false);
+                        let _ = run_command(c, trimmed, false, false);
                     }
                     None => println!("not connected: {trimmed}"),
                 }
@@ -532,7 +609,7 @@ fn repl(conn: Option<String>) -> rustyline::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{expects_table, format_table, rows_to_json};
+    use super::{columns_block, expects_table, format_table, rows_to_json};
     use serde_json::json;
 
     fn s(v: &str) -> Option<String> {
@@ -612,5 +689,18 @@ mod tests {
         let headers: Vec<String> = vec![];
         let rows: Vec<Vec<Option<String>>> = vec![];
         assert_eq!(rows_to_json(&headers, &rows), json!([]));
+    }
+
+    #[test]
+    fn columns_block_lists_name_and_type() {
+        let cols = vec![
+            ("id".to_string(), "int4".to_string()),
+            ("email".to_string(), "text".to_string()),
+        ];
+        let expected = json!([
+            {"name": "id", "type": "int4"},
+            {"name": "email", "type": "text"},
+        ]);
+        assert_eq!(columns_block(&cols), expected);
     }
 }
