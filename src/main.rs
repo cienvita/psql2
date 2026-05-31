@@ -20,7 +20,8 @@ const KEYWORDS: &[&str] = &[
 #[derive(Parser)]
 #[command(version, about = "A psql client with tab completion")]
 struct Cli {
-    /// libpq connection string or URL. Falls back to DATABASE_URL.
+    /// libpq connection string or URL. Falls back to the PG* environment
+    /// variables (PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD).
     connection: Option<String>,
 
     /// Run a single SQL command and exit instead of starting the REPL.
@@ -483,11 +484,64 @@ fn schema_detail(client: &mut Client, tables: &[String]) -> Result<Value, postgr
     Ok(Value::Array(described))
 }
 
-/// Resolve the connection string from the CLI argument or DATABASE_URL.
+/// The libpq keyword each PG* environment variable maps to.
+const PG_ENV_KEYWORDS: &[(&str, &str)] = &[
+    ("PGHOST", "host"),
+    ("PGPORT", "port"),
+    ("PGDATABASE", "dbname"),
+    ("PGUSER", "user"),
+    ("PGPASSWORD", "password"),
+];
+
+/// Resolve the connection string from the CLI argument or the PG*
+/// environment variables.
 fn resolve_connection(cli: &Cli) -> Option<String> {
     cli.connection
         .clone()
-        .or_else(|| std::env::var("DATABASE_URL").ok())
+        .or_else(|| connection_from_env(&|name| std::env::var(name).ok()))
+}
+
+/// Build a libpq keyword/value connection string from the PG* environment
+/// variables (PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD). `lookup`
+/// returns each variable's value. Returns None when none are set, so the
+/// REPL can start offline.
+fn connection_from_env(lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let mut parts = Vec::new();
+    for (env, keyword) in PG_ENV_KEYWORDS {
+        match lookup(env) {
+            Some(value) if !value.is_empty() => {
+                parts.push(format!("{keyword}={}", quote_conn_value(&value)));
+            }
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+/// Quote a value for a libpq keyword/value connection string. Values with
+/// whitespace, single quotes, or backslashes are wrapped in single quotes
+/// with backslash escaping; simpler values are returned unchanged.
+fn quote_conn_value(value: &str) -> String {
+    let needs_quote = value
+        .chars()
+        .any(|c| c.is_whitespace() || c == '\'' || c == '\\');
+    if !needs_quote {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for c in value.chars() {
+        if c == '\'' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
 }
 
 fn main() -> ExitCode {
@@ -496,7 +550,7 @@ fn main() -> ExitCode {
     // Non-interactive modes require a connection and emit only data to stdout.
     if cli.schema.is_some() || cli.command.is_some() {
         let Some(conn) = resolve_connection(&cli) else {
-            eprintln!("error: a connection is required (argument or DATABASE_URL)");
+            eprintln!("error: a connection is required (argument or PG* environment variables)");
             return ExitCode::FAILURE;
         };
         let mut client = match Client::connect(&conn, NoTls) {
@@ -544,7 +598,9 @@ fn repl(conn: Option<String>) -> rustyline::Result<()> {
             }
         },
         None => {
-            println!("not connected. Pass a connection string or set DATABASE_URL.");
+            println!(
+                "not connected. Pass a connection string or set the PG* environment variables."
+            );
             None
         }
     };
@@ -609,8 +665,12 @@ fn repl(conn: Option<String>) -> rustyline::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{columns_block, expects_table, format_table, rows_to_json};
+    use super::{
+        columns_block, connection_from_env, expects_table, format_table, quote_conn_value,
+        rows_to_json,
+    };
     use serde_json::json;
+    use std::collections::HashMap;
 
     fn s(v: &str) -> Option<String> {
         Some(v.to_string())
@@ -702,5 +762,61 @@ mod tests {
             {"name": "email", "type": "text"},
         ]);
         assert_eq!(columns_block(&cols), expected);
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name: &str| map.get(name).cloned()
+    }
+
+    #[test]
+    fn env_builds_keyword_value_string() {
+        let lookup = env(&[
+            ("PGHOST", "localhost"),
+            ("PGPORT", "15432"),
+            ("PGDATABASE", "controller-local"),
+            ("PGUSER", "postgres"),
+            ("PGPASSWORD", "postgres"),
+        ]);
+        assert_eq!(
+            connection_from_env(&lookup),
+            Some(
+                "host=localhost port=15432 dbname=controller-local user=postgres password=postgres"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn env_skips_unset_and_empty_vars() {
+        let lookup = env(&[("PGHOST", "db"), ("PGPORT", ""), ("PGUSER", "admin")]);
+        assert_eq!(
+            connection_from_env(&lookup),
+            Some("host=db user=admin".to_string())
+        );
+    }
+
+    #[test]
+    fn env_with_nothing_set_is_none() {
+        let lookup = env(&[]);
+        assert_eq!(connection_from_env(&lookup), None);
+    }
+
+    #[test]
+    fn env_quotes_values_with_special_chars() {
+        let lookup = env(&[("PGPASSWORD", "p w'd\\x")]);
+        assert_eq!(
+            connection_from_env(&lookup),
+            Some("password='p w\\'d\\\\x'".to_string())
+        );
+    }
+
+    #[test]
+    fn quote_leaves_plain_values_unquoted() {
+        assert_eq!(quote_conn_value("localhost"), "localhost");
+        assert_eq!(quote_conn_value("5432"), "5432");
     }
 }
